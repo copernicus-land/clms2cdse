@@ -1,6 +1,7 @@
 import os
 import tarfile
 import time
+import csv
 from datetime import datetime
 
 
@@ -17,10 +18,12 @@ def create_tars(
 	validator_mode: bool = True,
 ) -> int:
 	"""Traverse input_folder recursively and create a .tar archive for each directory
-	that contains at least one regular file. Directories named 'legend' are not
-	traversed as separate roots during discovery (so they won't be archived on
-	their own), but if a 'legend' subfolder exists inside a directory being
-	archived, it WILL be included inside that archive.
+	that contains a subdirectory named 'legend'.
+
+	Discovery rule:
+	- Walk recursively through input_folder
+	- When a folder named 'legend' is found, archive its parent directory
+	- Continue traversal recursively
 
 	Archives are written into output_folder. The archive name equals the source
 	directory's basename plus the '.tar' extension.
@@ -31,10 +34,9 @@ def create_tars(
 	- Normalize owner/group metadata to strings (uname/gname) and set uid/gid to 0 (default 'eea')
 	- Set directory mode to 775 and file mode to 666 (adjustable via parameters)
 
-	Logging: For each attempted directory, writes one line to log_file:
-	  CREATED <src_dir> -> <tar_path>
-	  SKIPPED_EXISTS <src_dir> -> <tar_path>
-	  ERROR <src_dir> -> <tar_path> | <exception>
+	Logging: Writes CSV rows to log_file with columns:
+	  time,status,tar,file_count
+	where file_count is the number of regular files written into the .tar.
 
 	Returns 0 if all tars created or skipped successfully, 1 if any errors occurred.
 	"""
@@ -43,14 +45,17 @@ def create_tars(
 	os.makedirs(output_folder, exist_ok=True)
 
 	try:
-		log_handle = open(log_file, 'w', encoding='utf-8')
+		log_handle = open(log_file, 'w', encoding='utf-8', newline='')
 	except Exception as e:
 		print(f"Cannot open log file '{log_file}': {e}")
 		return 1
 
-	def log(line: str):
+	csv_writer = csv.writer(log_handle)
+	csv_writer.writerow(["time", "status", "tar", "file_count"])
+
+	def log(status: str, tar_path: str, file_count: int = 0):
 		ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		log_handle.write(f"[{ts}] {line}\n")
+		csv_writer.writerow([ts, status, tar_path, file_count])
 		try:
 			log_handle.flush()
 			os.fsync(log_handle.fileno())
@@ -61,13 +66,10 @@ def create_tars(
 	total_archived = 0
 	total_skipped = 0
 
-	for root, dirs, files in os.walk(input_folder, topdown=True):
-		# Skip any directory named 'legend' (do not descend)
-		dirs[:] = [d for d in dirs if d.lower() != 'legend']
-
-		# If this directory has at least one regular file, archive it
-		file_paths = [f for f in files if os.path.isfile(os.path.join(root, f))]
-		if not file_paths:
+	for root, dirs, _files in os.walk(input_folder, topdown=True):
+		# Trigger archive when current directory contains a subfolder named 'legend'
+		has_legend_child = any(d.lower() == 'legend' for d in dirs)
+		if not has_legend_child:
 			continue
 
 		# Build tar filename: use the actual folder name (basename of root)
@@ -75,11 +77,18 @@ def create_tars(
 		tar_path = os.path.join(output_folder, f"{arc_base}.tar")
 
 		if os.path.exists(tar_path) and not overwrite:
-			log(f"SKIPPED_EXISTS {root} -> {tar_path}")
+			existing_file_count = 0
+			try:
+				with tarfile.open(tar_path, 'r') as tf_existing:
+					existing_file_count = sum(1 for m in tf_existing.getmembers() if m.isfile())
+			except Exception:
+				existing_file_count = 0
+			log("SKIPPED_EXISTS", tar_path, existing_file_count)
 			total_skipped += 1
 			continue
 
 		try:
+			file_counter = [0]
 			# Use GNU format to avoid PAX extended headers and mimic Linux GNU tar behaviour
 			with tarfile.open(tar_path, 'w', format=tarfile.GNU_FORMAT) as tf:
 				arc_root = f"./{arc_base}"  # leading ./ like reference
@@ -108,10 +117,11 @@ def create_tars(
 					ti.mtime = int(st.st_mtime)
 					with open(real_path, 'rb') as f:
 						tf.addfile(ti, f)
+						file_counter[0] += 1
 
 				# Capture a stable timestamp (earliest file mtime) for directories
 				all_file_paths = []
-				for sub_root, sub_dirs, sub_files in os.walk(root, topdown=True):
+				for sub_root, _sub_dirs, sub_files in os.walk(root, topdown=True):
 					for fname in sub_files:
 						all_file_paths.append(os.path.join(sub_root, fname))
 				if all_file_paths:
@@ -149,20 +159,19 @@ def create_tars(
 					# This may differ but keeps compatibility if validator_mode disabled
 					# Use root add to rely on TarFile internal ordering
 					def _generic_add():
-						for sub_root, sub_dirs, sub_files in os.walk(root, topdown=True):
+						for sub_root, _sub_dirs, sub_files in os.walk(root, topdown=True):
 							for fname in sorted(sub_files):
 								real = os.path.join(sub_root, fname)
 								rel = os.path.relpath(real, root).replace('\\', '/')
 								_add_file(real, f"{arc_root}/{rel}")
 					_generic_add()
 
-			log(f"CREATED {root} -> {tar_path}")
+			log("CREATED", tar_path, file_counter[0])
 			total_archived += 1
 		except Exception as e:
-			log(f"ERROR {root} -> {tar_path} | {e}")
+			log("ERROR", tar_path, 0)
 			errors += 1
 
-	log(f"SUMMARY archived={total_archived} skipped={total_skipped} errors={errors}")
 	try:
 		log_handle.close()
 	except Exception:
@@ -171,13 +180,19 @@ def create_tars(
 
 
 # ----------------- Editable invocation -----------------
-INPUT_FOLDER = r"M:\delivery_data\cfg25\Crops"  # change to your source root
-OUTPUT_FOLDER = r"M:\delivery_data\cfg25_tar"  # where tar files will go
-LOG_FILE = r"M:\delivery_data\cfg25_logs\tar_creation_log.txt"          # relative or absolute path
+INPUT_FOLDER = r"M:\delivery_data\reingestion-cfg25"  # change to your source root
+OUTPUT_FOLDER = r"M:\delivery_data\reingestion-cfg25_tar2"  # where tar files will go
+LOG_FILE = r"M:\delivery_data\reingestion-cfg25_logs\tar_creation_log.csv"          # relative or absolute path
 
 
 def main() -> int:
-	exit_code = create_tars(INPUT_FOLDER, OUTPUT_FOLDER, LOG_FILE, overwrite=False)
+	exit_code = create_tars(
+		INPUT_FOLDER,
+		OUTPUT_FOLDER,
+		LOG_FILE,
+		overwrite=False,
+		validator_mode=False,
+	)
 	print(f"Done. Exit code: {exit_code}")
 	return exit_code
 
