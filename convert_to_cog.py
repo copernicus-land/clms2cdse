@@ -5,10 +5,10 @@ the generated output.
 
 Example:
     -- Single file --
-    python mosaic_cog.py --input data/sample.tif --output output/result.tif
+    python convert_to_cog.py --input data/sample.tif --output output/result.tif
     
     -- All files in directory --
-    python mosaic_cog.py --input-dir data --output-dir output
+    python convert_to_cog.py --input-dir data --output-dir output
 """
 
 import argparse
@@ -25,7 +25,7 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("mosaic_cog")
+log = logging.getLogger("convert_to_cog")
 
 
 # ── Settings ────────────────────────────────────────────────────────
@@ -43,15 +43,15 @@ class CogSettings:
     output_dir: str = ""                # output directory for batch conversion
 
     # COG options
-    compress: str = "LZW"              # LZW, DEFLATE, ZSTD, NONE
+    compress: str = "LZW"               # LZW, DEFLATE, ZSTD, NONE
     predictor: int = 2                  # 1=none, 2=horizontal, 3=floating point
     blocksize: int = 1024
     overview_resampling: str = "MODE"   # MODE, NEAREST, AVERAGE, BILINEAR
     overviews: str = "AUTO"             # AUTO, NONE, or explicit levels
     num_threads: str = "ALL_CPUS"
-    bigtiff: str = "YES"               # YES, NO, IF_NEEDED
+    bigtiff: str | None = None          # None=leave GDAL default; YES, NO, IF_NEEDED
     output_type: str = ""               # empty=keep source, Byte, UInt16, Float32...
-    nodata: str | None = None            # nodata value
+    nodata: str | None = None           # nodata value
 
     # Behaviour
     validate: bool = True               # run gdalinfo after creation
@@ -132,9 +132,10 @@ def build_cog(input_path: str, output_path: str, settings: CogSettings) -> str:
         "-co", f"OVERVIEW_RESAMPLING={settings.overview_resampling}",
         "-co", f"OVERVIEWS={settings.overviews}",
         "-co", f"NUM_THREADS={settings.num_threads}",
-        "-co", f"BIGTIFF={settings.bigtiff}",
     ]
 
+    if settings.bigtiff is not None:
+        cmd.extend(["-co", f"BIGTIFF={settings.bigtiff}"])
     if settings.output_type:
         cmd.extend(["-ot", settings.output_type])
     if settings.nodata is not None:
@@ -202,7 +203,7 @@ def parse_args() -> CogSettings:
     p.add_argument("--blocksize", type=int, default=1024)
     p.add_argument("--overview-resampling", default="MODE")
     p.add_argument("--overviews", default="AUTO")
-    p.add_argument("--bigtiff", default="YES", choices=["YES", "NO", "IF_NEEDED"])
+    p.add_argument("--bigtiff", default=None, choices=["YES", "NO", "IF_NEEDED"])
     p.add_argument("--output-type", default="", help="GDAL output type (Byte, UInt16, ...)")
     p.add_argument("--nodata", default=None, help="Nodata value")
 
