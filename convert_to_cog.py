@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,6 +42,11 @@ class CogSettings:
     # Output
     output: str = ""                    # output COG path
     output_dir: str = ""                # output directory for batch conversion
+    work_dir: str = ""                  # temp VRT location (default: output dir)
+
+    # VRT options
+    strip_palette: bool = True           # convert Palette->Gray in a VRT wrapper
+    keep_vrt: bool = False               # keep generated VRT files on disk
 
     # COG options
     compress: str = "LZW"               # LZW, DEFLATE, ZSTD, NONE
@@ -91,6 +97,9 @@ def resolve_jobs(settings: CogSettings) -> list[tuple[str, str]]:
         if not os.path.isfile(settings.input_file):
             log.error(f"Input file not found: {settings.input_file}")
             sys.exit(1)
+        output_dir = os.path.dirname(settings.output)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         log.info(f"Using input raster: {settings.input_file}")
         return [(settings.input_file, settings.output)]
 
@@ -117,6 +126,45 @@ def resolve_jobs(settings: CogSettings) -> list[tuple[str, str]]:
         (input_path, os.path.join(settings.output_dir, os.path.basename(input_path)))
         for input_path in input_files
     ]
+
+
+def build_vrt(input_path: str, output_path: str, settings: CogSettings) -> str:
+    """Build a single-source VRT that can override palette metadata safely."""
+    vrt_dir = settings.work_dir or os.path.dirname(output_path)
+    if vrt_dir:
+        os.makedirs(vrt_dir, exist_ok=True)
+
+    vrt_path = os.path.join(
+        vrt_dir,
+        f"{os.path.splitext(os.path.basename(output_path))[0]}.vrt",
+    )
+    run(["gdalbuildvrt", "-overwrite", vrt_path, input_path], settings.dry_run)
+
+    if settings.strip_palette:
+        strip_palette_from_vrt(vrt_path, settings.dry_run)
+
+    return vrt_path
+
+
+def strip_palette_from_vrt(vrt_path: str, dry_run: bool = False):
+    """Remove palette metadata from a VRT without touching source pixel values."""
+    if dry_run:
+        log.info(f"[DRY RUN] Strip palette from {vrt_path}")
+        return
+
+    with open(vrt_path, "r", encoding="utf-8") as file_handle:
+        content = file_handle.read()
+
+    content = content.replace(
+        "<ColorInterp>Palette</ColorInterp>",
+        "<ColorInterp>Gray</ColorInterp>",
+    )
+    content = re.sub(r"<ColorTable>.*?</ColorTable>", "", content, flags=re.DOTALL)
+
+    with open(vrt_path, "w", encoding="utf-8") as file_handle:
+        file_handle.write(content)
+
+    log.info(f"Stripped palette/colortable from VRT: {vrt_path}")
 
 
 # ── Pipeline ────────────────────────────────────────────────────────
@@ -168,12 +216,24 @@ def pipeline(settings: CogSettings):
     total_jobs = len(jobs)
 
     for index, (input_path, output_path) in enumerate(jobs, start=1):
+        source_path = input_path
+        vrt_path = ""
+
+        if settings.strip_palette:
+            log.info(f"[{index}/{total_jobs}] Building VRT wrapper...")
+            vrt_path = build_vrt(input_path, output_path, settings)
+            source_path = vrt_path
+
         log.info(f"[{index}/{total_jobs}] Converting to COG → {output_path}")
-        build_cog(input_path, output_path, settings)
+        build_cog(source_path, output_path, settings)
 
         if settings.validate:
             log.info(f"[{index}/{total_jobs}] Validating...")
             validate_cog(output_path, settings.dry_run)
+
+        if vrt_path and not settings.keep_vrt and not settings.dry_run:
+            os.remove(vrt_path)
+            log.info(f"Removed temporary VRT: {vrt_path}")
 
     elapsed = time.time() - t0
     log.info(f"Done in {elapsed:.0f}s ✓ ({total_jobs} file(s))")
@@ -192,10 +252,15 @@ def parse_args() -> CogSettings:
     p.add_argument("--input-dir", help="Directory containing input rasters")
     p.add_argument("--output", "-o", help="Output COG path")
     p.add_argument("--output-dir", help="Output directory for batch conversion")
+    p.add_argument("--work-dir", help="Working directory for temporary VRT files")
 
     # Config
     p.add_argument("--config", "-c", help="Load settings from JSON file")
     p.add_argument("--save-config", help="Save current settings to JSON and exit")
+
+    # VRT options
+    p.add_argument("--no-strip-palette", action="store_true", help="Skip VRT palette stripping")
+    p.add_argument("--keep-vrt", action="store_true", help="Keep generated VRT files")
 
     # COG options
     p.add_argument("--compress", default="LZW", choices=["LZW", "DEFLATE", "ZSTD", "NONE"])
@@ -228,6 +293,11 @@ def parse_args() -> CogSettings:
         settings.output = args.output
     if args.output_dir:
         settings.output_dir = args.output_dir
+    if args.work_dir:
+        settings.work_dir = args.work_dir
+
+    settings.strip_palette = not args.no_strip_palette
+    settings.keep_vrt = args.keep_vrt
 
     settings.compress = args.compress
     settings.predictor = args.predictor
