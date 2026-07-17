@@ -20,6 +20,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, asdict
+import csv
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +29,14 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("convert_to_cog")
+
+
+"""
+GDAL not installed on your PATH #tonnudottir added to test
+"""
+GDALBUILDVRT = r"C:\ProgramData\anaconda3\Library\bin\gdalbuildvrt.exe"
+GDALTRANSLATE = r"C:\ProgramData\anaconda3\Library\bin\gdal_translate.exe"
+GDALINFO = r"C:\ProgramData\anaconda3\Library\bin\gdalinfo.exe"
 
 
 # ── Settings ────────────────────────────────────────────────────────
@@ -62,6 +72,10 @@ class CogSettings:
     # Behaviour
     validate: bool = True               # run gdalinfo after creation
     dry_run: bool = False               # print commands without executing
+
+    # Report
+    report_file: str = ""               # create a report from config
+
 
     @classmethod
     def from_json(cls, path: str) -> "CogSettings":
@@ -120,12 +134,47 @@ def resolve_jobs(settings: CogSettings) -> list[tuple[str, str]]:
         log.error(f"No TIFF files found in input directory: {settings.input_dir}")
         sys.exit(1)
 
+    ## Automatically derive output directory if not specified
+    #if not settings.output_dir:
+    #    settings.output_dir = settings.input_dir.replace(
+    #        r"M:\raw_data",
+    #        r"M:\delivery_data"
+    #    )
+
     os.makedirs(settings.output_dir, exist_ok=True)
+
     log.info(f"Found {len(input_files)} input rasters in {settings.input_dir}")
-    return [
-        (input_path, os.path.join(settings.output_dir, os.path.basename(input_path)))
-        for input_path in input_files
-    ]
+    log.info(f"Output root: {settings.output_dir}")
+
+    jobs = []
+
+    for input_path in input_files:
+
+        rel_path = os.path.relpath(
+            input_path,
+            settings.input_dir
+        )
+
+        output_path = os.path.join(
+            settings.output_dir,
+            rel_path
+        )
+
+        os.makedirs(
+            os.path.dirname(output_path),
+            exist_ok=True
+        )
+
+        jobs.append((input_path, output_path))
+
+    return jobs
+
+    #os.makedirs(settings.output_dir, exist_ok=True)
+    #log.info(f"Found {len(input_files)} input rasters in {settings.input_dir}")
+    #return [
+    #    (input_path, os.path.join(settings.output_dir, os.path.basename(input_path)))
+    #    for input_path in input_files
+    #]
 
 
 def build_vrt(input_path: str, output_path: str, settings: CogSettings) -> str:
@@ -138,7 +187,8 @@ def build_vrt(input_path: str, output_path: str, settings: CogSettings) -> str:
         vrt_dir,
         f"{os.path.splitext(os.path.basename(output_path))[0]}.vrt",
     )
-    run(["gdalbuildvrt", "-overwrite", vrt_path, input_path], settings.dry_run)
+    run([GDALBUILDVRT, "-overwrite", vrt_path, input_path], settings.dry_run)
+    #run(["gdalbuildvrt", "-overwrite", vrt_path, input_path], settings.dry_run)
 
     if settings.strip_palette:
         strip_palette_from_vrt(vrt_path, settings.dry_run)
@@ -172,7 +222,7 @@ def strip_palette_from_vrt(vrt_path: str, dry_run: bool = False):
 def build_cog(input_path: str, output_path: str, settings: CogSettings) -> str:
     """Convert a source raster directly to COG."""
     cmd = [
-        "gdal_translate",
+        GDALTRANSLATE, #tonnudottir changed from gdal_translate
         "-of", "COG",
         "-co", f"COMPRESS={settings.compress}",
         "-co", f"PREDICTOR={settings.predictor}",
@@ -196,7 +246,7 @@ def build_cog(input_path: str, output_path: str, settings: CogSettings) -> str:
 
 def validate_cog(output: str, dry_run: bool = False):
     """Step 3: Quick validation via gdalinfo."""
-    result = run(["gdalinfo", output], dry_run)
+    result = run([GDALINFO, output], dry_run) #tonnudottir changed from gdalinfo 
     if not dry_run:
         for line in result.stdout.splitlines():
             if any(k in line for k in ["Size", "LAYOUT", "Band 1", "Overviews:"]):
@@ -204,6 +254,126 @@ def validate_cog(output: str, dry_run: bool = False):
         size_mb = os.path.getsize(output) / (1024 * 1024)
         log.info(f"Output size: {size_mb:,.1f} MB")
 
+def collect_gdal_info(file_path: str) -> dict:
+    """
+    Collect basic GDAL information for reporting.
+    """
+
+    result = {
+        "file": file_path,
+        "size_mb": None,
+        "width": None,
+        "height": None,
+        "bands": None,
+        "compression": None,
+        "layout": None,
+        "photometric": None,
+        "block_x": None,
+        "block_y": None,
+        "overview_count": None,
+    }
+
+    try:
+        info = run([GDALINFO, file_path], False)
+
+        if os.path.exists(file_path):
+            result["size_mb"] = round(
+                os.path.getsize(file_path) / (1024 * 1024),
+                2
+            )
+
+        for line in info.stdout.splitlines():
+
+            if line.startswith("Size is"):
+                parts = line.replace("Size is", "").split(",")
+                result["width"] = parts[0].strip()
+                result["height"] = parts[1].strip()
+
+            elif "LAYOUT=" in line:
+                result["layout"] = line.split("=")[1].strip()
+
+            elif "COMPRESSION=" in line:
+                result["compression"] = line.split("=")[1].strip()
+
+            elif "Band 1 Block=" in line:
+                block = line.split("Block=")[1].split()[0]
+                bx, by = block.split("x")
+                result["block_x"] = bx
+                result["block_y"] = by
+
+                if "ColorInterp=" in line:
+                    result["photometric"] = (line.split("ColorInterp=")[1].split(",")[0].strip())
+
+            elif "Overviews:" in line:
+                ovrs = line.split("Overviews:")[1]
+                result["overview_count"] = len(
+                    [o for o in ovrs.split(",") if o.strip()]
+                )
+
+    except Exception as exc:
+        log.warning(f"Could not collect info from {file_path}: {exc}")
+
+        print(f"{os.path.basename(file_path)} -> "f"ColorInterp={result['photometric']}")
+    return result
+
+def append_report_row(
+    report_path: str,
+    before: dict,
+    after: dict
+):
+    """
+    Append one row to conversion report CSV.
+    """
+
+    file_exists = os.path.exists(report_path)
+
+    with open(
+        report_path,
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "timestamp",
+                "input_file",
+                "output_file",
+                "orig_size_mb",
+                "new_size_mb",
+                "orig_width",
+                "orig_height",
+                "new_width",
+                "new_height",
+                "orig_layout",
+                "new_layout",
+                "orig_compression",
+                "new_compression",
+                "orig_photometric",
+                "new_photometric",
+                "overview_count"
+            ])
+
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"),
+            before["file"],
+            after["file"],
+            before["size_mb"],
+            after["size_mb"],
+            before["width"],
+            before["height"],
+            after["width"],
+            after["height"],
+            before["layout"],
+            after["layout"],
+            before["compression"],
+            after["compression"],
+            before["photometric"],
+            after["photometric"],
+            after["overview_count"]
+        ])
 
 def pipeline(settings: CogSettings):
     """Run the full pipeline."""
@@ -226,6 +396,18 @@ def pipeline(settings: CogSettings):
 
         log.info(f"[{index}/{total_jobs}] Converting to COG → {output_path}")
         build_cog(source_path, output_path, settings)
+
+        if settings.report_file:
+
+            before_info = collect_gdal_info(input_path)
+
+            after_info = collect_gdal_info(output_path)
+
+            append_report_row(
+                settings.report_file,
+                before_info,
+                after_info
+            )
 
         if settings.validate:
             log.info(f"[{index}/{total_jobs}] Validating...")
