@@ -70,15 +70,74 @@ python convert_to_cog.py --config my_config.json --input scene.tif --output out.
 
 ---
 
+### `txt2sld2qml.py` — QGIS colour map .txt → SLD + QML
+
+Converts standard QGIS colour map export files (`.txt`) into
+[Styled Layer Descriptor](https://www.ogc.org/standard/sld/) (SLD) for
+GeoServer / MapServer and QGIS Layer Style (`.qml`) files.
+
+**What it does**
+
+- Reads QGIS colour map `.txt` files (INTERPOLATED ramps or DISCRETE value maps).
+- Generates **SLD 1.0.0** files with `<RasterSymbolizer>` / `<ColorMap>` — ready
+  for GeoServer, MapServer, or any OGC-compliant server.
+- Generates **QML** files for direct use in QGIS.
+- Supports an optional `--scale` factor to convert real values to raw pixel
+  values when the GeoTIFF stores data with a scale/offset (e.g. ×10000 for
+  CLMS HR-VPP products).
+
+**Key features**
+
+- Handles both `INTERPOLATION:INTERPOLATED` (ramp) and `DISCRETE` colour maps.
+- No external dependencies — uses only Python stdlib (`xml.etree.ElementTree`).
+- Keeps the original `.txt` values as the source of truth (no guessing).
+- Valid SLD 1.0.0 XML output.
+
+**Quick start**
+
+```bash
+# Convert all .txt files in a directory
+python3 txt2sld2qml.py ./txt/ --outdir .
+
+# Apply a scale factor (e.g. raw pixel values = real values × 10000)
+python3 txt2sld2qml.py ./txt/ --outdir . --scale 10000
+```
+
+**Input format**
+
+Each `.txt` file is a standard QGIS colour map export:
+
+```
+# QGIS Generated Color Map Export File
+INTERPOLATION:INTERPOLATED    (or DISCRETE)
+value, R, G, B, Alpha, label
+```
+
+**Output structure**
+
+```
+output/
+├── sld/    ← GeoServer / MapServer styles
+└── qml/    ← QGIS native styles
+```
+
+---
+
 ## Layout
 
-More scripts will be added here as the CDSE migration pipeline grows. Each
-tool lives in its own top-level `.py` file with a matching section in this
-README.
+| Tool | Purpose |
+|------|---------|
+| `convert_to_cog.py` | Raster → Cloud Optimized GeoTIFF |
+| `analyze_cog_header.py` | Inspect/validate COG structure |
+| `process_files_new.py` | Batch processing pipeline |
+| `txt2sld2qml.py` | QGIS colour map .txt → SLD + QML |
 
 ```
 clms2cdse/
-├── convert_to_cog.py   ← raster → COG
+├── convert_to_cog.py
+├── analyze_cog_header.py
+├── process_files_new.py
+├── txt2sld2qml.py
 ├── README.md
 └── LICENSE.txt
 ```
